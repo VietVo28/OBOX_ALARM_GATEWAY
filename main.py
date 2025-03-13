@@ -1,47 +1,79 @@
-from fastapi import APIRouter, FastAPI
-from app.routes import (
-    camera_router, user_router, wireless_button_router,history_battery_percentage_router,history_alarm_router,setting_router,
-setting_auto_register_router, wifi_router
-)
+import asyncio
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from app.core.database import init_db
+from app.core.setting_env import settings
+from app.main import api_router
+from app.utils.common import checkIsAarch64, public_server_ip
+from app.utils.path_currrent_souce import current_source_path
+
+from app.utils.mqtt import mqtt_client
+
+from app.utils.sync_data_to_cloud import sync_data_to_cloud
+from app.websocket.websocket import router as api_router_ws
+from starlette.middleware.cors import CORSMiddleware
+
+# Chỉ định logger của httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = FastAPI()
-api_router = APIRouter()
-
-# # Hàm tự động load tất cả routers từ thư mục routes
-# def auto_load_routers(router: APIRouter, package: str):
-#     # Duyệt qua các module trong package `routes`
-#     package_path = package.replace('.', '/')
-#     for module_info in pkgutil.iter_modules([package_path]):
-#         module_name = f"{package}.{module_info.name}"
-#         print(module_name)
-#         module = importlib.import_module(module_name)
-#
-#         # Kiểm tra xem module có thuộc tính `router` không
-#         if hasattr(module, 'router'):
-#             # Lấy prefix và tags từ module, nếu không có thì dùng giá trị mặc định
-#             prefix = getattr(module, 'prefix', f"/{module_info.name}")
-#             tags = getattr(module, 'tags', [module_info.name])
-#             # Thêm router vào api_router
-#             router.include_router(
-#                 getattr(module, 'router'),
-#                 prefix=prefix,
-#                 tags=tags
-#             )
 
 
-# Gọi hàm auto_load_routers để đăng ký tất cả các router
-# auto_load_routers(api_router, 'app.routes')
+# Cấu hình thư mục tĩnh và template
 
-# Đăng ký api_router vào ứng dụng
-api_router.include_router(camera_router.router, prefix="/camera", tags=["camera"])
-api_router.include_router(user_router.router, prefix="/user", tags=["user"])
-api_router.include_router(wireless_button_router.router, prefix="/wireless-button", tags=["wireless-button"])
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    asyncio.create_task(sync_data_to_cloud.sync_data())
+    asyncio.create_task(mqtt_client.connect())
+    # asyncio.create_task(receive_data_button.receive_data())
+    if checkIsAarch64():
+        from app.utils.recieve_data_button import receive_data_button
+        threading.Thread(target=receive_data_button.start,daemon=True).start()
+    threading.Thread(target=public_server_ip,daemon=True).start()
+    # threading.Thread(target=host_wifi,daemon=True).start()
+    yield
+    print("Shutting down the server")
 
-api_router.include_router(history_battery_percentage_router.router, prefix="/history-battery-percentage", tags=["history-battery-percentage"])
 
-api_router.include_router(history_alarm_router.router, prefix="/history-alarm", tags=["history-alarm"])
-api_router.include_router(setting_router.router, prefix="/setting", tags=["setting"])
-api_router.include_router(setting_auto_register_router.router, prefix="/setting-auto-register", tags=["setting-auto-register"])
-api_router.include_router(wifi_router.router, prefix="/wifi", tags=["wifi"])
 
-app.include_router(api_router)
+app = FastAPI(
+    title="Oryza metadata FastAPI Backend",
+    docs_url="/docs",
+    lifespan=lifespan,
+)
+app.include_router(api_router, prefix="")
+
+
+
+app.include_router(api_router_ws, prefix="/ws")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/", StaticFiles(directory="templates", html=True), name="static")
+
+if __name__ == "__main__":
+    file_path = os.path.abspath(__file__)
+    current_directory = os.path.dirname(file_path)
+    current_source_path.set(current_directory)
+
+    path = os.path.join(current_directory, "data")
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    if settings.ENVIRONMENT == "dev":
+        uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=True)
+    else:
+        uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=False)
